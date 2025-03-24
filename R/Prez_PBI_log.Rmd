@@ -1,0 +1,2563 @@
+---
+title: "IOM PowerBI Usage Analytics"
+subtitle: "Exploring logs at Tenant Level to implement Governance Rules"
+date: "`r format(Sys.Date(),  '%d %B %Y')`"
+output:
+  iomdown::pptx_slides
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      message = FALSE, 
+                      warning = FALSE,
+                      collapse = FALSE,
+                      comment = "#>",
+                      # fig.width = 5.5, fig.height = 4,
+                      fig.retina = 2, 
+                      fig.width = 9,
+                      fig.asp = 0.618,
+                      #fig.align = "center",
+                      dev = "ragg_png",
+                      out.width = "90%")
+
+```
+
+```{r library, include=FALSE}
+options(scipen = 999) # turn-off scientific notation like 1e+48
+set.seed(1)
+extrafont::loadfonts(quiet=TRUE)
+library(officedown)
+library(iomthemes)
+library(ggplot2)
+library(rvg)
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(knitr)
+
+memory.limit(size = 16000)
+# turn off the automatic use of showtext functionality, so that the dml function can works properly
+showtext::showtext_auto(FALSE)
+```
+
+
+```{r dataad, include=FALSE,  message = FALSE, warning = FALSE}          
+## Data from PRISM
+staff <- readr::read_csv(here::here("data-raw", "staff_unique_email2.csv"),
+                         locale = locale(encoding = "WINDOWS-1252",   asciify = TRUE))|>
+  janitor::clean_names()|>
+  dplyr::filter( !( personnel_no == "Grand Total")) |>
+  dplyr::mutate( personnel_no = as.numeric(personnel_no),
+                grade_cat = dplyr::case_when(
+                        grade %in% c("D-1" , "D-2","E-1", "E-2")   ~ "Director",
+                        grade %in% c("P-4",  "P-5" )   ~ "P4 to P5",
+                        grade %in% c("P-1",  "P-2",  "P-3", "NO-A", "NO-B", "NO-C", "NO-D" )   ~ "P1 to P3 / NO",
+                        grade %in% c(  "G-6",  "G-7" , "G-8")   ~ "G6 to G8",
+                        grade %in% c( "G-1" , "G-2",  "G-3",  "G-4","G-5")   ~ "G1 to G5",
+                        #grade %in% c( "NO-A", "NO-B", "NO-C", "NO-D" )   ~ "National Officer",
+                        grade %in% c( "UG" )   ~ "Ungraded",
+                        .default ="Ungraded"),
+                grade_cat = factor(grade_cat, levels = c("Director",
+                                                       "P4 to P5",
+                                                       "P1 to P3 / NO",
+                                                       "G6 to G8",
+                                                       "G1 to G5",
+                                                       "Ungraded" ))  ,
+                ## Try reconstruct email --
+                email_constructed =  paste0(tolower(substring(first_name, 1, 1) ),
+                                            tolower(stringr::str_extract(last_name, "^[^ ]+")),
+                                            '@iom.int')   ,
+                email_check =  dplyr::if_else(tolower(email_address) ==  email_constructed, "match_constructed_mail","no_match_constructed_mail"),
+                user_principal_name =  dplyr::if_else(is.na(email_address),
+                                                      email_constructed,
+                                                      tolower(email_address))) |>
+                ## Remove duplicate based on email & PERN
+                group_by(user_principal_name) |>
+                filter(personnel_no == max(personnel_no)) |>
+                ungroup()
+
+
+# z_check_staff_duplicate_email_all <- staff[duplicated(staff$user_principal_name), ]
+# 
+# levels(as.factor(staff$grade))
+# 
+# table(staff$grade_cat, useNA = "ifany")
+# table(staff$email_in_prism, useNA = "ifany")
+# table(staff$email_in_prism, staff$grade_cat, useNA = "ifany")
+# table(staff$email_check, useNA = "ifany")
+# table(staff$email_in_prism, staff$email_check, useNA = "ifany")
+# 
+# z_check_staff_mail <- staff |> 
+#   dplyr::filter(email_check =="no_match_constructed_mail") |>
+#   dplyr::select(personnel_no, email_check,   email_address, email_constructed,first_name, last_name,
+#               email_in_prism, user_principal_name)
+#dput(names(staff_unique_email))
+
+## Data From active directory
+#ad <- readr::read_csv( here::here("data-raw", "exportUsers_2024-10-1_2.csv")) |> 
+ad <- readr::read_csv( here::here("data-raw", "AADUsers.csv")) |> 
+          janitor::clean_names()  |>
+          dplyr::mutate(dpt = dplyr::if_else(is.na(department), FALSE, TRUE))  |>
+  #dplyr::filter(account_enabled == "TRUE") |>
+ # dplyr::filter(user_type == "Member") |>
+  dplyr::select(user_principal_name,  user_type, display_name, creation_type, created_date_time,
+                surname,  given_name,  job_title, 
+                usage_location, 
+                department ) |>
+  dplyr::mutate( fullname =  paste0(tolower(given_name)," ", tolower(surname)),
+                 country_usage  = countrycode::countrycode(usage_location, "iso2c", "country.name")) |>
+  dplyr::left_join( staff, by =c("user_principal_name")) |>
+  ## Check who has email
+  dplyr::mutate(email_in_prism =  dplyr::if_else(is.na(email_address), "Not_in_PRISM","Matched_in_PRISM"))
+ 
+#rm(staff)
+#z_check_ad_duplicate_email  <-ad[duplicated(ad$user_principal_name), ]
+
+```
+
+```{r datacapacity, include=FALSE,  message = FALSE, warning = FALSE}
+Capacity <- jsonlite::fromJSON(
+                readLines(here::here("data-raw", "Capacity.json")),
+                flatten = TRUE) |>
+  select(Id, DisplayName, Sku, Region)|>
+  dplyr::rename(  "CapacityId"="Id",
+                     "CapacityName"="DisplayName") |>
+  dplyr::mutate( CapacityId = toupper(CapacityId) ) |>
+  dplyr::mutate(SkuDesc = dplyr::case_when(
+
+# A1: This is an entry-level SKU for Power BI Embedded, designed for independent software vendors (ISVs) and developers who want to embed Power BI visuals into their applications. It provides a dedicated set of resources for consistent performance1.
+          Sku =="A1" ~ " A1 -Visual Embedding",  
+# F16: This SKU is part of the Microsoft Fabric offering, which integrates components from Power BI, Azure Synapse, and Azure Data Explorer. The F16 capacity provides 16 capacity units, offering a higher level of resources for more demanding workloads1.
+          Sku =="F16" ~ "F16 -Fabric",  
+# FT1: This is a trial SKU for Microsoft Fabric, allowing users to test and evaluate the capabilities of Fabric without a full commitment. It provides a limited set of resources suitable for small-scale testing and development1.
+          Sku =="FT1" ~ "FT1 -Fabric Trial",  
+# P1: This is a Power BI Premium SKU, designed for enterprises needing a comprehensive BI solution. The P1 capacity offers 8 capacity units and is suitable for large-scale deployments, providing enhanced performance and additional features like paginated reports and AI capabilities2.
+          Sku =="P1" ~ "P1 -PBI Premium",  
+# PP3: This refers to the Premium Per User (PPU) SKU, which combines the features of Power BI Pro with additional Premium capabilities on a per-user basis. It is ideal for organizations that need Premium features but do not require a full Premium capacity
+          Sku =="PP3" ~ "PP3 -Premium-Per-User"  ))
+
+WorkSpace <- jsonlite::fromJSON(
+                readLines(here::here("data-raw", "WorkSpace.json")),
+                flatten = TRUE) |>
+    dplyr::rename(  "WorkSpaceName"="Name") |>
+    dplyr::rename(  "WorkSpaceId"="Id") |>
+    dplyr::left_join( Capacity, by=c("CapacityId"))
+  
+ 
+Datasets <- WorkSpace |>
+  dplyr::select(WorkSpaceId, WorkSpaceName,   CapacityId, CapacityName,Sku, SkuDesc, Region,
+         Description, Type, State, IsOrphaned, Datasets) |>
+  tidyr::unnest(Datasets)   |>  
+  dplyr::mutate(ContentProvider = dplyr::case_when( 
+    # AnalysisServices: Refers to datasets that are connected to SQL Server Analysis Services (SSAS) or Azure Analysis Services (AAS). These datasets use either DirectQuery or Live Connection modes to connect to the data source.
+      ContentProviderType =="AnalysisServices" ~ "DirectQuery or Live Connection to SQL Server Analysis Services",  
+# CSV:  Datasets created from CSV files. These datasets are typically imported into Power BI and stored in the Power BI service.
+      ContentProviderType =="CSV" ~ "Imported  CSV files stored in the Power BI service",  
+# Excel:  Datasets created from Excel workbooks. These datasets can be imported into Power BI and stored in the Power BI service.
+      ContentProviderType =="Excel" ~ "Imported Excel workbooks stored in the Power BI service",  
+# InCompositeMode: Datasets that use a combination of DirectQuery and Import modes. This allows for a hybrid approach where some data is imported and some is queried directly from the source.
+      ContentProviderType =="InCompositeMode" ~ "Datasets using combination of DirectQuery and Import modes",  
+# InDirectQueryMode:  Datasets that use DirectQuery mode to connect directly to the data source without importing the data into Power BI. This is useful for large datasets where importing is impractical.
+      ContentProviderType =="InDirectQueryMode" ~ "Large Datasets using DirectQuery mode, aka not imported into Power BI",
+# InImportMode:  Datasets that are fully imported into Power BI. The data is stored in the Power BI service, allowing for fast query performance.
+      ContentProviderType =="InImportMode" ~ "Imported Datasets stored in the Power BI service with fast query",  
+# PbixInCompositeMode:  Similar to InCompositeMode, but specifically refers to datasets created from Power BI Desktop files (.pbix) that use a combination of DirectQuery and Import modes.
+      ContentProviderType =="PbixInCompositeMode" ~ "Imported Datasets with combination of DirectQuery and Import modes",  
+# PbixInDirectQueryMode:  Similar to InDirectQueryMode, but specifically refers to datasets created from Power BI Desktop files (.pbix) that use DirectQuery mode.
+      ContentProviderType =="PbixInDirectQueryMode" ~ "Imported Datasets with DirectQuery",  
+# PbixInImportMode:  Similar to InImportMode, but specifically refers to datasets created from Power BI Desktop files (.pbix) that are fully imported into Power BI.
+      ContentProviderType =="PbixInImportMode" ~ "Imported Datasets through the Power BI Desktop files",  
+# PbixInLiveConnectionMode:  Datasets created from Power BI Desktop files (.pbix) that use Live Connection mode to connect to SSAS or AAS. This mode allows for real-time data interaction without importing the data.
+      ContentProviderType =="PbixInLiveConnectionMode" ~ "Live Connection mode from Power BI Desktop files",  
+# RealTime:  Datasets that support real-time data updates. These datasets can be used for dashboards that need to display live data.
+      ContentProviderType =="RealTime" ~ "Real-time data updates datasets",  
+# RealTimeInPubNubMode:  Real-time datasets that use PubNub for data streaming. PubNub is a real-time messaging service that allows for live data updates.
+      ContentProviderType =="RealTimeInPubNubMode" ~ "Real-time live data updates for data streaming", 
+# RealTimeInPushMode:  Real-time datasets that use the Power BI REST API to push data into Power BI. This allows for real-time data updates by pushing new data points directly to the dataset. 
+      ContentProviderType =="RealTimeInPushMode" ~ "Real-time Power BI REST Push API",  
+# RealTimeInStreamingMode:  Real-time datasets that use streaming dataflows to ingest and process data in real-time. This mode is used for scenarios where data needs to be processed and displayed immediately.
+      ContentProviderType =="RealTimeInStreamingMode" ~ "Real-time streaming dataflows",  
+# RetailSales:  This is a specific content provider type used for retail sales data. It is typically used in scenarios where retail sales data is being analyzed.
+      ContentProviderType =="RetailSales" ~ "Retail sales data",  
+# Unknown: This indicates that the content provider type is not recognized or is unknown. It may be used for custom or unsupported data sources.
+      ContentProviderType =="Unknown" ~ "Custom or unsupported data sources.",  
+# UsageMetricsUserDashboard: Datasets that contain usage metrics for user dashboards. These datasets provide insights into how dashboards are being used within the organization.
+      ContentProviderType =="UsageMetricsUserDashboard" ~ "Usage metrics for dashboards",  
+# UsageMetricsUserReport: Datasets that contain usage metrics for user reports. These datasets provide insights into how reports are being used within the organization
+      ContentProviderType =="UsageMetricsUserReport" ~ "Usage metrics for user reports")   ) |> 
+      dplyr::left_join( ad, by=c("ConfiguredBy" ="user_principal_name"))  |>
+  dplyr::mutate(iom_user = dplyr::if_else( stringr::str_detect(ConfiguredBy, "@iom.int"), "Yes", "No") ) |>
+  dplyr::mutate(iom_admin = dplyr::if_else( stringr::str_detect(ConfiguredBy, "@iomint.onmicrosoft.com"), "Yes", "No") )  
+  
+
+# Flatten the nested structures
+Users <- WorkSpace |>
+  dplyr::select(WorkSpaceId, WorkSpaceName,  CapacityId, 
+                CapacityName,Sku,SkuDesc, Region,
+                Description, Type, State, IsOrphaned, Users) |>
+  tidyr::unnest(Users) |>
+  dplyr::rename(  "UserId"="Identifier") |>
+  dplyr::left_join( ad, by=c("UserId" ="user_principal_name")) |>
+  dplyr::mutate(iom_user = dplyr::if_else( stringr::str_detect(UserId, "@iom.int"), "Yes", "No") ) |>
+  dplyr::mutate(iom_admin = dplyr::if_else( stringr::str_detect(UserId, "@iomint.onmicrosoft.com"), "Yes", "No") )
+
+# Flatten the nested structures
+Reports <- WorkSpace |>
+  dplyr::select(WorkSpaceId, WorkSpaceName,  
+          CapacityId, CapacityName,Sku,SkuDesc, Region, Description, 
+          Type, State, IsOrphaned, Reports) |>
+  tidyr::unnest(Reports)
+
+# Flatten the nested structures
+Dashboards <- WorkSpace |>
+  dplyr::select(WorkSpaceId, WorkSpaceName,  CapacityId, CapacityName,Sku,SkuDesc, Region,
+         Description, Type, State, IsOrphaned, Dashboards) |>
+  tidyr::unnest(Dashboards)
+
+
+workspace_profile <- Datasets |> 
+  group_by(SkuDesc, Type, WorkSpaceName) |>
+  summarise(configured_dataset = n(), .groups = 'drop') |>
+  dplyr::full_join( Reports |>
+                    group_by( WorkSpaceName ) |>
+                    summarise(Reports_count = n(), .groups = 'drop') ,
+                  
+                  by= c("WorkSpaceName")  ) |>  
+ dplyr::full_join( Dashboards |>
+                    group_by( WorkSpaceName ) |>
+                    summarise(Dashboards_Count = n(), .groups = 'drop') ,
+                  
+                  by= c("WorkSpaceName")  )      |>
+  dplyr::full_join( Users |>
+                      group_by( WorkSpaceName, AccessRight) |>
+                      summarise(Count = n(), .groups = 'drop') |>
+                      pivot_wider(names_from = AccessRight, values_from = Count, values_fill = list(Count = 0)),
+                    
+                    by= c("WorkSpaceName")  )   |>
+  dplyr::arrange(desc(Admin))
+
+```
+
+
+```{r data, include=FALSE,  message = FALSE, warning = FALSE}
+# Load the JSON files
+logs <- bind_rows(
+  
+  # jsonlite::fromJSON( here::here("data-raw", "PBIActivityEvents-20241217-202412231149.json")),
+  # jsonlite::fromJSON( here::here("data-raw", "PBIActivityEvents-20241218-202412231149.json")),
+  # jsonlite::fromJSON( here::here("data-raw", "PBIActivityEvents-20241219-202412231149.json")),
+  # jsonlite::fromJSON( here::here("data-raw", "PBIActivityEvents-20241220-202412231149.json")),
+  # jsonlite::fromJSON( here::here("data-raw", "PBIActivityEvents-20241221-202412231149.json")),
+  
+  ##
+  jsonlite::fromJSON( here::here("data-raw", "PBIActivityEvents-20241215-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241214-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241213-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241212-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241211-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241210-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241209-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241208-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241207-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241206-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241205-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241204-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241203-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241202-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241201-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241130-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241129-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241128-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241127-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241126-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241125-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241124-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241123-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241122-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241121-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241120-202412171358.json")),
+  jsonlite::fromJSON(here::here("data-raw", "PBIActivityEvents-20241119-202412171358.json"))
+)  |>
+  separate(Activity, into = c("ActivityPart0",
+                              "ActivityPart1", 
+                              "ActivityPart2", 
+                              "ActivityPart3", 
+                              "ActivityPart4", 
+                              "ActivityPart5",
+                              "ActivityPart6",
+                              "ActivityPart7",
+                              "ActivityPart8",
+                              "ActivityPart9",
+                              "ActivityPart10",
+                              "ActivityPart11"), 
+           sep = "(?=[A-Z])", 
+           fill = "right",
+           remove = FALSE) |>
+  dplyr::select ( - ActivityPart0 ) |>  
+  
+  
+  ## categories Activities
+  
+### Operation comon type
+# ViewReport: When a user views a report.
+# CreateReport: When a user creates a new report.
+# EditReport: When a user edits an existing report.
+# DeleteReport: When a user deletes a report.
+# ViewDashboard: When a user views a dashboard.
+# CreateDashboard: When a user creates a new dashboard.
+# EditDashboard: When a user edits an existing dashboard.
+# DeleteDashboard: When a user deletes a dashboard.
+# ShareReport: When a user shares a report with others.
+# ShareDashboard: When a user shares a dashboard with others.
+# ExportReport: When a user exports a report.
+# ExportData: When a user exports data from a report or dataset.
+# CreateDataset: When a user creates a new dataset.
+# EditDataset: When a user edits an existing dataset.
+# DeleteDataset: When a user deletes a dataset.
+# RefreshDataset: When a user refreshes a dataset.
+# CreateWorkspace: When a user creates a new workspace.
+# EditWorkspace: When a user edits an existing workspace.
+# DeleteWorkspace: When a user deletes a workspace.
+# AddUserToWorkspace: When a user adds another user to a workspace.
+# RemoveUserFromWorkspace: When a user removes another user from a workspace.
+# PublishApp: When a user publishes an app.
+# UpdateApp: When a user updates an existing app.
+# DeleteApp: When a user deletes an app.
+# InstallApp: When a user installs an app.
+  
+  dplyr::mutate(Activity_type = case_when(
+    
+    Activity %in% c( "ViewDashboard", "DownloadReport",
+                     "ExportReport",  "PrintReport",
+                     "ViewReport") ~ "Product View",
+    
+    Activity %in% c("AddTile", "CopyReport", 
+                    "CreateDashboard", "CreateReport", "CreateScorecard", 
+                    "DeleteDashboard", "DeleteReport", "DeleteTile",   "EditReport",
+                    "PublishToWebReport", "RenameReport",  "ViewDataflow",
+                    "ViewTile") ~ "Product Management",
+    
+    Activity %in% c("AddUsersToGatewayClusterDatasource",
+                    "CreateEmailSubscription","MigrateWorkspaceIntoCapacity",
+                    "CreateGatewayClusterUser",  "ShareDashboard",
+                    "ShareDataset", "ShareReport","ListDataAccessRoles",
+                    "UpdateEmailSubscription",   "OptInForPPUTrial", 
+                    "OptInForProTrial") ~ "User Management",
+    
+    Activity %in% c("AddExperimentRun", "AddModelVersion",
+                    "ApplyChangeToPowerBIModel", "BindMonikersToDatasources",
+                    "CreateSemanticMetric","EditDataset",
+                    "CreateSqlQueryFromSqlAnalyticsEndpointLakehouse",
+                    "CreateVisualQueryFromSqlAnalyticsEndpointLakehouse",
+                    "CreateCloudDatasource", "CreateCloudDatasourceFromKindPath",
+                    "CreateDataflow", "CreateDataset", "CreateDatasetByQuickShare",
+                    "DeleteDataflow", "DeleteDataset",
+                    "DeleteDatasetRows", "EvaluateDataSourcesAgainstTenantDlpPolicies", 
+                    "GetAllGatewayClusterDatasources", 
+                    "GetCloudSupportedDatasources",
+                    "GetDatasourceDetailsWithCredentialsAsync",
+                    "GetDatasources", "GetFollowedGoals", 
+                    "GetGatewayClusterDatasource", "GetGatewayClusterDatasourceStatus",
+                    "GetGatewayClusterMemberStatus", "GetGatewayClusters",
+                    "GetGatewayClusterStatus", "GetGatewayClusterSupportedDatasources",
+                    "GetGatewayRegions", "GetLakehouseTableDetails", 
+                    "GetMyGoals", "GetPowerBIDataModel",
+                    "GetPowerBIDataModelDiagramLayouts",
+                    "GetScorecard", "GetScorecardByReportId", 
+                    "GetScorecardHierarchies", "GetScorecards", "GetScorecardViews",
+                    "ListLakehouseTables", "LoadLakehouseTable", "PreviewLakehouseTable",
+                    "ReadDataflow",  "ReadExperimentRun",
+                    "CancelDataflowRefresh", "CancelDatasetRefresh",
+                    "RefreshDataset", "RefreshSqlAnalyticsEndpointLakehouseMetadata",
+                    "RequestDataflowRefresh",
+                    "SetScheduledRefresh","SetScheduledRefreshOnDataflow",
+                    "UpdateDataflow", "UpdateDatasetParameters", 
+                    "UpdateDatasource", "UpdateDatasourceCredentials",
+                    "UpdateExperimentRun", "UpdateFeaturedTables",  
+                    "UpdateFolderAccess", "UpdateGatewayClusterDatasource", 
+                    "UpdateGatewayClusterDatasource", 
+                    "SavePowerBIDataModelDiagramLayouts","CreateGateway", "DeleteGateway",
+                    "DeleteGatewayCluster", 
+                    "ViewSqlAnalyticsEndpointLakehouse", "ViewWarehouse",
+                    "UpdateSqlAnalyticsEndpointLakehouse", "UpdateTaskFlow",
+                    "UpdateWarehouseMetadata", "TakeOverDatasource",
+                    "CreateGatewayClusterDatasource",
+                    "TakeOverDataset",
+                    "CreateTaskFlow",  "DeleteGatewayClusterDatasource",
+                    "DeleteLakehouseTable") ~ "Data Management",
+    
+    Activity %in% c("CreateDirectory","CreateFile", 
+                    "CreateFolder", "UpdateFolder","DeleteFileOrBlob", "DeleteFolder",
+                    "RenameFileOrDirectory",    "CreateSubfolder","UpdateSubfolder",   
+                    "DeleteSubfolder", "MoveItemsIntoSubfolder", 
+                    "ReadEnvironmentResource","UpdateWorkspaceSettingsContent", 
+                    "CreateArtifact","DeleteArtifact","UpdateArtifact", 
+                    "ReadArtifact", "RunArtifact","ScheduleArtifact", 
+                    "ArtifactAccessRequest","ExportArtifact", "ExportArtifactDownload",
+                    "GetSnapshots", "GetTaskFlow",
+                    "GetUserDatasourcesByDataSourceReference", "GetWorkspaces", "Import",
+                    "ChangeCapacityState", "CommitToGit", "CreateAlmPipeline",
+                    "DeployAlmPipeline", "GenerateCustomVisualAADAccessToken",
+                    "GenerateDataflowSasToken",
+                    "GenerateEmbedToken", "GenerateScreenshot", 
+                    "InitiateCloudOAuthLogin", "InitiateGatewayClusterOAuthLogin",
+                    "InstallApp", "InstallTeamsAnalyticsReport", 
+                    "MapUpn",  "MountStorageByMssparkutils",
+                    "PatchGatewayCluster", 
+                    "RunEmailSubscription", "SetConfigurationAlmPipeline",
+                    "StartRunNotebook", "StopNotebookSession",
+                    "UpdateApp") ~ "System Operations",
+    
+    Activity %in% c("AnalyzedByExternalApplication", 
+                    "AnalyzeInExcel", "ConnectFromExternalApplication",
+                    "ConnectWarehouseAndSqlAnalyticsEndpointLakehouseFromExternalApp",
+                    "ExploreDataExternally",
+                    "CopilotInteraction", "RequestCopilot", 
+                    "ViewSparkAppLog") ~ "External Interactions",
+    TRUE ~ "No Category"    )) |>
+  dplyr::mutate( CreationTime = as.POSIXct(CreationTime, format = "%Y-%m-%dT%H:%M:%S"),
+                 CreationDay = format(as_date(CreationTime, tz = "CET"), "%Y-%m-%d") )
+# Display the structure of the data
+#str(logs)
+# Summary of Log Data
+#summary <- as.data.frame(summary(logs)) 
+
+# Id: A unique identifier for the activity event.
+# RecordType: The type of record, typically indicating the source of the event.
+# CreationTime: The date and time when the event was created.
+# Operation: The type of operation performed (e.g., ViewReport, CreateDashboard).
+# OrganizationId: The identifier for the organization where the event occurred.
+# UserKey: A unique identifier for the user who performed the operation.
+# UserId: The email address of the user who performed the operation.
+# Workload: The type of workload (e.g., PowerBI).
+# UserType: The type of user (e.g., Member, Guest). 
+## -- o users -- 2- admin - 4 system -6 other - including none & PowerBI
+# ClientIP: The IP address from which the user performed the operation.
+# Activity: A description of the activity performed.
+# ItemName: The name of the item involved in the activity (e.g., report name, dashboard name).
+# WorkSpaceName: The name of the workspace where the activity occurred.
+# DatasetName: The name of the dataset involved in the activity.
+# ReportName: The name of the report involved in the activity.
+# DashboardName: The name of the dashboard involved in the activity.
+# CapacityId: The identifier for the capacity where the activity occurred.
+# CapacityName: The name of the capacity where the activity occurred.
+# AppName: The name of the app involved in the activity.
+# DistributionMethod: The method used to distribute the item (e.g., Share, Publish).
+
+
+
+
+logs <- logs |>
+  dplyr::mutate(iom_user = dplyr::if_else( stringr::str_detect(UserId, "@iom.int"), "Yes", "No") ) |>
+  dplyr::mutate(iom_admin = dplyr::if_else( stringr::str_detect(UserId, "@iomint.onmicrosoft.com"), "Yes", "No") ) |>
+  ## Consumption method 
+#  * __Web-Based__	Methods where users access Power BI content directly through web interfaces or embedded in a site. "Power BI Web" through the Power BI service on the web,
+#  "Simplified Embedding"	Streamlined method for embedding Power BI content, making integration easier for developers.
+# 
+#  * __Office__
+#  "Power BI Teams Notification" receive notifications in Microsoft Teams about updates to Power BI content, "Power BI Teams Tab App" as tabs in Teams channels for easy access and collaboration, "PowerPoint add-in"Embeds Power BI reports into PowerPoint presentations for interactive slides,"Export Report" to PDF, PowerPoint, or Excel,  "Power BI Office Personal App" allowing access within Office applications,
+# 
+#  * __Mobile__	Methods where users access Power BI content through mobile devices.	
+# "Power BI Mobile" providing flexibility and accessibility on the go, or  "Power BI Teams Personal App" within Microsoft Teams on mobile devices 
+  
+  dplyr::mutate(Consumption  = dplyr::case_when( 
+  ConsumptionMethod %in% c("Power BI Web", "Simplified Embedding", 
+                           "Embedding for your organization") ~ "Web-Based",  
+  ConsumptionMethod %in% c("Power BI Teams Notification", "Power BI Teams Tab App",
+                           "PowerPoint add-in", "Export Report", "Power BI Office Personal App") ~ "Office",
+  ConsumptionMethod %in% c("Power BI Mobile", "Power BI Teams Personal App") ~ "Mobile"  )   ) |>
+  
+
+  dplyr::left_join( ad, by=c("UserId" ="user_principal_name")) 
+
+# wb <- openxlsx::createWorkbook()
+# openxlsx::addWorksheet(wb, "PBI_log")
+# openxlsx::writeData(wb, "PBI_log",
+#                     logs2 |> 
+#       dplyr::select(Id, RecordType, CreationTime, Operation, OrganizationId,
+#         UserType,iom_user, UserKey, Workload, UserId, ClientIP, WorkSpaceName,
+#         DatasetName, ReportName,   ReportType,DashboardName, AppName,
+#         ActivityPart1, ActivityPart2, 
+#         ## From AD
+#         surname, given_name,
+#         mail, job_title, usage_location, country_usage, office_location,
+#         city, department, fullname, 
+#         ##  from PRISM
+#         email_has, email_check, first_name, last_name, 
+#         pern, gender, person_id, manager_id, adjusted_manager_id, 
+#         employee_group, grade, grade_cat, position_name, supervisor_flag, 
+#         business_area, country_code, country_name, l3_org, l4_org, 
+#         l5_org, l6_org, name_of_organizational_unit),
+#   withFilter = TRUE)
+# openxlsx::saveWorkbook(wb, here::here("data-raw","PBI_log.xlsx"), overwrite = TRUE)
+
+
+# c("Id", "RecordType", "CreationTime", "Operation", "OrganizationId", 
+# "UserType", "UserKey", "Workload", "UserId", "ClientIP", "Activity", 
+
+# "ActivityPart1", "ActivityPart2", "ActivityPart3", "ActivityPart4", 
+# "ActivityPart5", "ActivityPart6", "ActivityPart7", "ActivityPart8", 
+# "ActivityPart9", "ActivityPart10", "ActivityPart11", "DatasetName", 
+
+# "DatasetId", "IsSuccess", "RequestId", "ActivityId", "EndPoint", 
+# "RefreshEnforcementPolicy", "UserAgent", "DatasourceInformations", 
+# "ItemName", "WorkSpaceName", "CapacityId", "CapacityName", "WorkspaceId", 
+
+# "ObjectId", "DataConnectivityMode", "ArtifactId", "ArtifactName", 
+# "RefreshType", "LastRefreshTime", "ArtifactKind", "ItemId", "PackageId", 
+
+# "DataflowId", "DataflowName", "DataflowRefreshScheduleType", 
+# "DataflowType", "AggregatedWorkspaceInformation", "DataflowAccessTokenRequestParameters", 
+
+# "ResultStatus", "ObjectType", "ObjectDisplayName", "Experience", 
+# "ReportName", "ReportId", "ReportType", "DistributionMethod", 
+# "ConsumptionMethod", "HasFullReportAttachment", "SubscriptionDetails", 
+
+# "AppName", "AppReportId", "AppId", "ModelsSnapshots", 
+
+# "ImportId", 
+# "ImportSource", "ImportType", "ImportDisplayName", 
+# "CapacityUsers",  "CapacityState", 
+
+# "WorkspacesSemicolonDelimitedList", "ExportedArtifactInfo", 
+# "Schedules", "SharingInformation",
+# "Datasets",
+
+# "SharingAction",  "SharingScope", 
+
+# "ExportedArtifactDownloadInfo", "ArtifactAccessRequestInfo", 
+# "DataflowAllowNativeQueries", "IsTenantAdminApi", 
+
+#"DatasourceId", 
+# "GatewayClusterId", "GatewayClusterDatasources",
+
+#"DashboardName", # "DashboardId", 
+
+# "TileText", "GatewayId", "ShareLinkId", "CustomVisualAccessTokenResourceId", 
+# "CustomVisualAccessTokenSiteUri", "Monikers", "ModelId", "OrgAppPermission", 
+# "EmbedTokenId", "PowerPlatformEnvironmentId",
+
+# "DeploymentPipelineId", 
+# "DeploymentPipelineObjectId", "DeploymentPipelineStageOrder", 
+# "DeploymentPipelineOperationId", 
+
+# "GatewayClustersObjectIds", "GatewayStatus",
+
+# "DatasourceObjectIds", "FolderObjectId", "FolderDisplayName", 
+
+# "FolderAccessRequests", "SubfolderId", "SubfolderObjectId", "SubfolderName", 
+
+# "PaginatedReportDataSources", "UserInformation", "ReportMobileLayoutAction", 
+# "SubscribeeInformation", "ExternalSubscribeeInformation", "SubscriptionSchedule", 
+# "TableName", "UpdateFeaturedTables", "InstallTeamsAnalyticsInformation", 
+# "CredentialSetupMode", "GatewayName", "GatewayType", "Datasources", 
+# "GatewayMemberId", "TargetWorkspaceId", "CopiedReportName", "CopiedReportId", 
+# "GitIntegrationRequest", "Upns", "DatasetCertificationStage", 
+# "InPlaceSharingEnabled", "DeploymentPipelineDisplayName", "DeploymentPipelineAccesses", 
+# "ItemNewName", "OriginalOwner", "TakingOverOwner", "ModelSettings", 
+# "TemplateAppObjectId", "TemplatePackageName", "TemplateAppVersion", 
+# "TemplateAppOwnerTenantObjectId", "TemplateAppFolderObjectId", 
+# "IsUpdateAppActivity", "IsTemplateAppFromMarketplace", "TemplateAppIsInstalledWithAutomation", 
+# "PinReportToTabInformation", "AuditedArtifactInformation", "MentionedUsersInformation", 
+# "WorkspaceAccessList", "CreationDay", 
+
+# "iom_user", "surname", 
+# "given_name", "mail", "job_title", "usage_location", 
+# "office_location", "city", "department", "fullname", 
+
+# "country", "country_usage", 
+# "email_has", "email_check", "first_name", "last_name", "pern", 
+# "gender", "person_id", "manager_id", "adjusted_manager_id", "employee_group", 
+# "grade", "grade_cat", "position_name", "supervisor_flag", "business_area", 
+# "country_code", "country_name", "l3_org", "l4_org", "l5_org", 
+# "l6_org", "name_of_organizational_unit")
+
+
+```
+
+
+```{r mapdata, include=FALSE,  message = FALSE, warning = FALSE}
+# Get world map data from rnaturalearth
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") |>
+  # Remove Antarctica
+  dplyr::filter(sovereignt != "Antarctica") |>
+  # Transform the world map to Bertin 1953 projection
+  # sf::st_transform(world, crs = "+proj=bertin1953")
+  # Transform the world map to Robinson projection
+  sf::st_transform(world, crs = "ESRI:54030")
+
+# # Calculate centroids for each country
+# world_centroids <- sf::st_centroid(world) |>
+#   # Extract coordinates from the geometry column
+#   mutate(long = sf::st_coordinates(.)[,1],
+#          lat = sf::st_coordinates(.)[,2])
+## Better alternative
+centroid <- read.csv("https://github.com/gavinr/world-countries-centroids/raw/refs/heads/master/dist/countries.csv")|>
+## Remove centroid for sub territories
+  dplyr::filter( ISO == AFF_ISO )|>
+  dplyr::filter( COUNTRY != "Canarias" ) |>
+  # Convert to an sf object
+  sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)  |>
+  # Transform the coordinates
+  sf::st_transform(crs = "ESRI:54030") |>
+# Extract the transformed coordinates back into separate columns
+#centroid.unique1 <- centroid.unique
+  # Extract the transformed coordinates back into separate columns
+  dplyr::mutate(long = sf::st_coordinates(geometry)[,1],
+                lat = sf::st_coordinates(geometry)[,2])
+
+```
+
+# Analysing PowerBI Usage 
+
+Understanding the usage patterns and performance of IOM PowerBI environment is crucial for optimizing its efficiency and effectiveness. 
+
+Analyzing the structure of PowerBI items and related events log provides valuable insights into how users interact with reports and dashboards, the performance of queries, and potential areas for improvement.
+
+Without sufficient governance planning, __informal data management practices__ that  are overly reliant on judgment and experience level of individuals do prevail. This comes with a a significant dependency on undocumented tribal knowledge.
+
+Through this [analysis](https://dev.azure.com/IOMCloud/IOM_Data_Standards/_git/iom_log_retrieval), we aim to initiate a purposeful effort to standardize, improve, and document IOM data management and governance practices.
+
+--- 
+
+# Why an Analysis of Analytics?
+  
+ * __User Behavior Insights__: By examining the events log, you can identify which reports and dashboards are most frequently accessed, helping you understand user preferences and needs.
+
+ * __Performance Monitoring__: The events log captures detailed information about query performance, allowing you to pinpoint slow-running queries and optimize them for better performance.
+
+  * __Resource Optimization__: Understanding the usage patterns can help in optimizing resource allocation, ensuring that your PowerBI environment is running efficiently without unnecessary resource consumption.
+
+ * __Security and Compliance__: Monitoring the events log helps in tracking access patterns and identifying any unauthorized access attempts, ensuring your data remains secure and compliant with regulations.
+
+
+---
+
+# Monitoring Power BI tenant across workspaces
+
+As the tenant admin, detailed logs can be [extracted](https://www.techtarget.com/searchdatamanagement/tip/The-Power-BI-PowerShell-cmdlet-cheat-sheet) allowing to: 
+ 
+ 1. Get insights into __how much__ each report, dashboard & app is being used  
+ 
+ 2. Get insights into __by whom/when/how__ reports, dashboards & apps are being used  
+ 
+ 3. Monitor which __Data Sources__ are being used on Dashboards  
+ 
+ 4. Know __how many new__ reports, dashboards, and datasets have been made
+ 
+ 5. Get an overview of user access for each __workspace__  
+ 
+ 6. Know the distribution of __data pipeline__ refreshing times & errors  
+
+
+---
+
+# How to implement PowerBI BI within an organiation?
+
+Microsoft has defined 4 distinct [Usage scenario](https://learn.microsoft.com/en-us/power-bi/guidance/powerbi-implementation-planning-usage-scenario-overview#content-collaboration-and-delivery-scenarios) for PowerBI & Fabric:
+
+ * __[Personal BI](https://learn.microsoft.com/en-us/power-bi/guidance/powerbi-implementation-planning-usage-scenario-personal-bi)__: Using personal workspaces for private usage, content creators have a lot of freedom and flexibility to create content for individual usage. This scenario describes .
+
+ * __[Team BI](https://learn.microsoft.com/en-us/power-bi/guidance/powerbi-implementation-planning-usage-scenario-team-bi)__: Using workspace for both collaboration and distribution, team members (creators and consumers) can work closely together.
+
+ * __[Departmental BI](https://learn.microsoft.com/en-us/power-bi/guidance/powerbi-implementation-planning-usage-scenario-departmental-bi)__: Using a Power BI app for distributing content, a larger number of users within a department or business unit can benefit from analytics products.
+
+ * __[Enterprise BI](https://learn.microsoft.com/en-us/power-bi/guidance/powerbi-implementation-planning-usage-scenario-enterprise-bi)__: Using Premium capacity to distribute certified analytics to a larger number of read-only consumers, content can be distributed at scale. 
+ 
+
+--- 
+
+# Expected Outcomes from better governance
+
+
+ * __Enhanced User Experience__: Tailor your reports and dashboards to better meet user needs based on their interaction patterns.For instance, Reduce the number and increase the quality of reports that are shared with the executive leadership.
+ 
+ * __Improved Performance__: Identify and resolve performance bottlenecks, leading to faster and more responsive reports. This can also mean to ensure that workspaces delivering content directly within apps
+
+ * __Increased Security__: Detect and mitigate potential security threats by monitoring access logs, for instance by reducing export to Excel.
+
+ * __Cost Efficiency__: Optimize resource usage, potentially reducing costs associated with running your PowerBI environment. This can be done through a better management of workspace aligned with organisational structure
+
+---
+
+
+```{r ph=officer::ph_location_fullsize()} 
+## Data Limitation
+## Build a table with key metrics per users
+userpbi <- Datasets |>
+  group_by( ConfiguredBy) |>
+  summarise(configured_dataset = n(), .groups = 'drop') |>
+  dplyr::full_join( Users |>
+                    group_by( UserId, AccessRight) |>
+                    summarise(Count = n(), .groups = 'drop') |>
+                    pivot_wider(names_from = AccessRight, 
+                                values_from = Count, 
+                                values_fill = list(Count = 0)),
+          by= c("ConfiguredBy" = "UserId")  )      |>
+  dplyr::mutate(pbi = "In_powerBI")
+
+# filtering on the premium capacity only
+userpbi_p1 <- Datasets |>
+  dplyr::filter(Sku =="P1") |>
+  group_by( ConfiguredBy) |>
+  summarise(configured_dataset = n(), .groups = 'drop') |>
+  dplyr::full_join( Users |>
+                    dplyr::filter(Sku =="P1") |>
+                    group_by( UserId, AccessRight) |>
+                    summarise(Count = n(), .groups = 'drop') |>
+                    pivot_wider(names_from = AccessRight, 
+                                values_from = Count, 
+                                values_fill = list(Count = 0)),
+          by= c("ConfiguredBy" = "UserId")  )      |>
+  dplyr::mutate(pbi = "In_powerBI_Premium")
+
+
+links <- ad |>
+  dplyr::mutate(email_in_prism = dplyr::if_else( is.na(email_in_prism  ), "Matched_in_PRISM", email_in_prism)) |>
+  dplyr::left_join(userpbi_p1, 
+                   by=c("user_principal_name"="ConfiguredBy")) |>
+  
+  dplyr::mutate(is_pbi = dplyr::if_else( is.na(pbi), 
+                                         "Not_in_powerBI_Premium", 
+                                         "In_powerBI_Premium"),
+                has_configured_dataset = dplyr::if_else(configured_dataset == 0 ,
+                                                        "No_dataset" , 
+                                                        "Has_configured_dataset"),
+                has_configured_dataset = dplyr::if_else( is.na(configured_dataset),
+                                                         "No_dataset" , 
+                                                         has_configured_dataset),
+                is_Admin = dplyr::if_else( Admin == 0   ,
+                                           "Not_Workpace_admin", 
+                                           "Is_Workspace_admin") ,
+                is_Admin = dplyr::if_else(  is.na(Admin) ,
+                                            "Not_Workpace_admin", 
+                                            is_Admin)  ) |>
+  group_by(user_type,  email_in_prism, is_pbi   ) |>
+    #group_by(user_type,  email_in_prism, is_pbi, has_configured_dataset, is_Admin  ) |>
+  summarise(n = dplyr::n() )  
+
+
+## summarize data
+links  |>
+  ggforce::gather_set_data(x = c("user_type",
+                                 "email_in_prism",
+                                 "is_pbi" ) ) |>
+  ggplot(
+    aes(x, 
+        id = id, 
+        split = y, 
+        value = n)) +
+  ## colour lines by sex 
+  ggforce::geom_parallel_sets( aes(fill = is_pbi),
+                               alpha = 0.5,
+                               axis.width = 0.2) +
+  ## fill in the label boxes grey
+  ggforce::geom_parallel_sets_axes(axis.width = 0.15,
+                                   fill = "grey80", 
+                                   color = "grey80") +
+  ## change text colour and angle (needs to be adjusted)
+  ggforce::geom_parallel_sets_labels(color = "black",
+                                     angle = 0,
+                                     size = 5) +
+  ## adjusted y and x axes (probably needs more vertical space)
+  scale_x_discrete(name = NULL, 
+                   expand = c(0, 0.2)) + 
+  theme_iom(font_size = 14, 
+            grid = FALSE ) +
+  ## remove axis labels
+  theme(  axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text.y = element_blank(),
+          panel.background = element_blank(),
+          legend.position = "none",                    # move legend to bottom
+          legend.title = element_blank(),                # remove title
+  ) +
+  labs(title = "Directory Mapping: Email (AAD) Vs HR (PRISM) Vs Analytics (PowerBI Premium)",
+       subtitle = "There are significant mismatch between directories preventing advanced usage analytics as well as content targeting through roles definition. The HR directory does not include yet standard job classification and organisational unit classification.",
+       x = NULL,
+       y = NULL,
+       caption = "Source: IOM Azure Active Directory, PRISM, PowerBI Tenants Records") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+
+```{r ph=officer::ph_location_fullsize()} 
+
+links <- userpbi_p1 |>
+  dplyr::left_join(ad, 
+                   by=c("ConfiguredBy"="user_principal_name")) |>
+  
+  dplyr::mutate(email_in_prism = dplyr::if_else( is.na(email_in_prism  ),
+                                                 "Matched_in_PRISM",
+                                                 email_in_prism)) |>
+  dplyr::mutate(is_pbi = dplyr::if_else( is.na(pbi),
+                                         "Not_in_powerBI_Premium",
+                                         "In_powerBI_Premium"),
+                has_configured_dataset = dplyr::if_else(configured_dataset == 0 ,
+                                                        "No_dataset" , 
+                                                        "Has_configured_dataset"),
+                has_configured_dataset = dplyr::if_else( is.na(configured_dataset),
+                                                         "No_dataset" , 
+                                                         has_configured_dataset),
+                is_Admin = dplyr::if_else( Admin == 0   ,
+                                           "Not_Workpace_admin", 
+                                           "Is_Workspace_admin") ,
+                is_Admin = dplyr::if_else(  is.na(Admin) ,
+                                            "Not_Workpace_admin", 
+                                            is_Admin)  ) |>
+  group_by(  email_in_prism,  has_configured_dataset, is_Admin  ) |>
+  summarise(n = dplyr::n() )  
+
+
+## summarize data
+links  |>
+  ggforce::gather_set_data(x = c( "email_in_prism",
+                                  "has_configured_dataset",
+                                  "is_Admin" ) ) |> 
+  ggplot(aes(x, 
+             id = id, 
+             split = y, 
+             value = n)) +
+  ## colour lines by sex 
+  ggforce::geom_parallel_sets( aes(fill = email_in_prism),
+                               alpha = 0.5,
+                               axis.width = 0.2) +
+  ## fill in the label boxes grey
+  ggforce::geom_parallel_sets_axes(axis.width = 0.15,
+                                   fill = "grey80", 
+                                   color = "grey80") +
+  ## change text colour and angle (needs to be adjusted)
+  ggforce::geom_parallel_sets_labels(color = "black",
+                                     angle = 0,
+                                     size = 5) +
+  ## adjusted y and x axes (probably needs more vertical space)
+  scale_x_discrete(name = NULL, 
+                   expand = c(0, 0.2)) + 
+  theme_iom(font_size = 14, 
+            grid = FALSE ) +
+  ## remove axis labels
+  theme(  axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text.y = element_blank(),
+          panel.background = element_blank(),
+          legend.position = "none",                    # move legend to bottom
+          legend.title = element_blank(),                # remove title
+  ) +
+  labs(title = "Mapping of advances users within PowerBI Premium",
+       subtitle = "Many WorkSpace Admin or Dataset Creator do not have a matched profile in the HR directory",
+       x = NULL,
+       y = NULL,
+       caption = "Source: IOM Azure Active Directory, PRISM, PowerBI Tenants Records") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+---
+
+# Part 1 -- Products Metrics 
+
+
+| **Indicator Name**           | **Why It's Useful**                                                                 | **How to Calculate**                                                                                                           |
+|------------------------------|-------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| **Dataset Usage Frequency**   | Identifies the most and least used Dataset, helping prioritize maintenance and updates. | Count the number of times each Dataset is accessed  |
+| **Report Usage Frequency**   | Identifies the most and least used reports, helping prioritize maintenance and updates. | Count the number of times each report is accessed filtering on `ReportViewed` events. |
+| **Dashboard Usage Frequency**   | Identifies the most and least used Dashboard, helping prioritize maintenance and updates. | Count the number of times each report is accessed filtering on `DashboardViewed` events. |
+| **App Utilization**          | Ensures workspaces are effectively leveraging apps to distribute content.            | Count the number of apps created and the frequency of app updates and accesses using `Get-PowerBIActivityEvent` cmdlet to filter for `AppViewed` events. |
+
+
+---
+
+# Dataset
+
+A `dataset` is a collection of data that data analysts can import or connect to in Power BI.
+It serves as the foundation for creating reports and dashboards.
+
+Ideally, centralized `datasets` shall be created and reused across multiple reports and dashboards to redundancy and ensures consistency and scheduled refreshes should be configured to ensure the data is up-to-date without manual intervention. 
+
+Row-level security (RLS) can also be configured to restrict data access based on user roles
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()} 
+
+Datasets |>   
+  dplyr::group_by(ContentProvider) |> #, IsRefreshable
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n))  |>
+  head(10) |>
+  ggplot( aes(x = reorder( stringr::str_wrap(ContentProvider, 60), n),
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") +
+#  geom_bar( stat = "identity", fill = "#0033A0") +
+ # iomthemes::scale_fill_iom_d(direction = -1) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Datasets Management in Power BI within the whole IOM Tenant",
+       subtitle = paste0("Source and mode of operation for the ", nrow(Datasets), " related datasets " ),
+       x = " ", y = "", 
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 14,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+ 
+Datasets |>   
+  filter( CapacityName == "IOM - Reporting Platform") |>
+  dplyr::group_by(ContentProvider) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(10) |>
+  ggplot( aes(x = reorder( stringr::str_wrap(ContentProvider, 60), n),
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Datasets Management in Power BI within IOM - Reporting Platform Capacity",
+       subtitle = paste0("Source and mode of operation for the ", nrow(Datasets |>   
+  filter( CapacityName == "IOM - Reporting Platform")), " datasets" ),
+       x = " ", y = "", 
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 14,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+# topDatasetName <- logs |> 
+#   filter( !(is.na(DatasetName))) |>
+#   filter( Operation %in% c( "ViewReport",   "ViewDashboard" ) ) |>
+#   group_by(DatasetName, DatasetId, Operation ) |>
+#   summarise(ActivityCount = n()) |>
+#   arrange(desc(ActivityCount))  
+# 
+# topDatasetNameRefreshType  <- logs |> 
+#   filter( !(is.na(DatasetName))) |> 
+#   group_by(DatasetName, RefreshType  ) |>
+#   summarise(ActivityCount = n()) |>
+#   arrange(desc(ActivityCount))  
+
+logs |> 
+  dplyr::filter( !(is.na(DatasetName))) |>
+  filter( !(is.na(DatasetName))) |>
+  filter( Operation %in% c( "ViewReport",   "ViewDashboard" ) ) |>
+  dplyr::group_by(DatasetName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  ggplot( aes(x = reorder(DatasetName, n),
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "What are the Most Frequently Accessed Dataset?",
+       subtitle = "This view outlines the importance of using a predefined naming convention for dataset",
+       x = "Item Name", y = "", 
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+# api <- logs |>  
+#   filter( RefreshType == "ViaApi")  
+# 
+# 
+# refresh <- logs |>  
+#    filter( !(is.na(RefreshType))) |> 
+#   dplyr::group_by(RefreshType, Activity) |>
+#   dplyr::summarise( n = dplyr::n()) |>
+#   dplyr::arrange(desc(n)) 
+  
+logs |> 
+  filter( Activity %in% c( "RefreshDataset" ) ) |>
+  #filter( !(is.na(RefreshType))) |> 
+  dplyr::group_by(RefreshType) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x = reorder(RefreshType, n),
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") + 
+  labs(title = "How Dataset are Refreshed?",
+       subtitle = "Number of Datset Refreshing Events",
+       x = "Item Name", y = "", 
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 14,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topRefreshDataset <- logs |> 
+  filter( Activity %in% c( "RefreshDataset" ) ) |>
+  group_by(DatasetName  ) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))  |> 
+  head(15) |>
+  dplyr::arrange(ActivityCount)
+  
+logs |> 
+  filter( Activity %in% c( "RefreshDataset" ) ) |>
+  #filter( !(is.na(RefreshType))) |> 
+  dplyr::filter(DatasetName %in% topRefreshDataset$DatasetName ) |>
+  dplyr::mutate( DatasetName  = factor( DatasetName , levels = topRefreshDataset$DatasetName )) |>
+  dplyr::group_by(RefreshType, DatasetName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n))   |>
+  ggplot( aes(x = reorder(DatasetName, n),
+              y = n, 
+              fill = RefreshType)) +
+  geom_bar( stat = "identity" ) + 
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  labs(title = "What Dataset have been regularly Refreshed?",
+       subtitle = "Are top Dataset used for analysis are configured for automatic refresh?",
+       x = "Item Name", y = "", 
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 14,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+```{r}
+#### Implementing Row-Level Security
+
+# Row-level security (RLS) enables Power BI admins to define filters based on user roles, effectively restricting data access based on the attributes of each user. This is a powerful tool for preventing unauthorized data access, and should be used in conjunction with other security settings for a robust and well-rounded data security plan.
+```
+
+
+
+---
+
+# Reports 
+
+A `report` is a collection of visualizations (like charts and graphs) that are based on a dataset.
+Reports can have multiple pages, similar to a multi-page document. Each page can contain different visualizations to analyze various aspects of the data.
+
+Ideally, reports template  with standardized layouts and visualizations should be implemented to maintain consistency across the organization. 
+
+Report versions should also be tracked to manage updates and changes effectively and user feedback should be collected to improve and refine the reports
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  dplyr::filter(Operation =="ViewReport" & !(is.na(ReportName))) |>
+  dplyr::group_by(ReportName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  ggplot( aes(x = reorder(ReportName, n),
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "What are the Most Frequently Accessed Report?", 
+       x = "Item Name", y = "", 
+       subtitle = "This chart outline the importance of naming conventions",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 14,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topReport <- logs |> 
+  dplyr::filter(Operation =="ViewReport" & !(is.na(ReportName)) ) |>
+  dplyr::group_by(ReportName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  dplyr::arrange(n)
+
+# logs |> 
+#   dplyr::filter(Operation =="ViewReport" ) |>
+#   dplyr::filter(ReportName %in% topReport$ReportName ) |>
+#   dplyr::mutate( ReportName  = factor( ReportName , levels = topReport$ReportName )) |>
+#   dplyr::group_by(ReportName, Consumption, , ConsumptionMethod) |>
+#   dplyr::summarise( n = dplyr::n()) |>
+#   dplyr::group_by(Consumption) |>
+#   dplyr::mutate( per = round(100* n /sum(n ),1) ) |>
+#   dplyr::arrange(desc(n))  ->d
+
+
+logs |> 
+  dplyr::filter(Operation =="ViewReport" ) |>
+  dplyr::filter(ReportName %in% topReport$ReportName ) |>
+  dplyr::mutate( ReportName  = factor( ReportName , levels = topReport$ReportName )) |>
+  dplyr::group_by(ReportName, Consumption) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::group_by(Consumption) |>
+  dplyr::mutate( per = round(100* n /sum(n ),1) ) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x =  ReportName ,
+              y = n,
+              fill = Consumption)) +
+  geom_bar( stat = "identity" ) +
+  #geom_bar( stat = "identity", fill = "#0033A0") +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #facet_wrap( vars( Consumption), nrow =2) + 
+  labs(title = "How are those Reports being consumed?", 
+       x = "Report Name", y = "", 
+       subtitle = "Content gains to benefit from multiple distribution method. Should we give more focus to distribution over mobile?",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topReport <- logs |> 
+  dplyr::filter(Operation =="ViewReport" & !(is.na(ReportName)) ) |>
+  dplyr::group_by(ReportName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  dplyr::arrange(n)
+
+logs |> 
+  dplyr::filter(Operation =="ViewReport" ) |>
+  dplyr::filter(ReportName %in% topReport$ReportName ) |>
+  dplyr::mutate( ReportName  = factor( ReportName , levels = topReport$ReportName )) |>
+  dplyr::group_by(ReportName, grade_cat) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::group_by(grade_cat) |>
+  dplyr::mutate( per = round(100* n /sum(n ),1),
+                  grade_cat = factor(grade_cat, levels = c("Director",
+                                                                    "P4 to P5",
+                                                                    "P1 to P3 / NO",
+                                                                    "G6 to G8",
+                                                                    "G1 to G5",
+                                                                    "No Grade"))) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x =  ReportName ,
+              y = n,
+              fill = grade_cat)) +
+  geom_bar( stat = "identity" ) +
+  #geom_bar( stat = "identity", fill = "#0033A0") +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #facet_wrap( vars( grade_cat), nrow =2) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Who are the users of the top Reports?", 
+       x = "Report Name", y = "", 
+       subtitle = "The more diverse is the audience, the more likely the report is critical. \n NA indicated users that could not be matched with PRISM Staff Listing extracts",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topReport <- logs |> 
+  dplyr::filter(Operation =="ViewReport" & !(is.na(ReportName)) ) |>
+  dplyr::filter(grade_cat %in% c("Director",  "P4 to P5") ) |>
+  dplyr::group_by(ReportName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  dplyr::arrange(n)
+
+logs |> 
+  dplyr::filter(Operation =="ViewReport" ) |>
+  dplyr::filter(grade_cat %in% c("Director",  "P4 to P5") ) |>
+  dplyr::filter(ReportName %in% topReport$ReportName ) |>
+  dplyr::mutate( ReportName  = factor( ReportName , levels = topReport$ReportName )) |>
+  dplyr::group_by(ReportName, grade_cat) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::group_by(grade_cat) |>
+  dplyr::mutate( per = round(100* n /sum(n ),1),
+                  grade_cat = factor(grade_cat, levels = c("Director",
+                                                                    "P4 to P5",
+                                                                    "P1 to P3 / NO",
+                                                                    "G6 to G8",
+                                                                    "G1 to G5",
+                                                                    "No Grade"))) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x =  ReportName ,
+              y = n,
+              fill = grade_cat)) +
+  geom_bar( stat = "identity" ) +
+  #geom_bar( stat = "identity", fill = "#0033A0") +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #facet_wrap( vars( grade_cat), nrow =2) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "What are the top Reports for P4 & Above users?", 
+       x = "Report Name", y = "", 
+       subtitle = "The more diverse is the audience, the more likely the report is critical. \n NA indicated users that could not be matched with PRISM Staff Listing extracts",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topReport <- logs |> 
+  dplyr::filter(Operation =="ViewReport" & !(is.na(ReportName)) ) |>
+  dplyr::filter(iom_user  == "No" & iom_admin =="No" ) |>
+  dplyr::group_by(ReportName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  ggplot( aes(x =  reorder(ReportName,n) ,
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") +
+  labs(title = "What are the top Reports for non IOM users?", 
+       x = "Report Name", y = "", 
+       subtitle = "Not that many reports are actually consumed externally",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+# Dashboard
+
+A `dashboard` is a single-page, at-a-glance view of key metrics that are crucial for decision-making.
+It can contain visualizations from multiple reports and datasets with interactive elements like slicers and filters to allow users to explore the data on their own.
+
+Ideally, Dashboard template  with standardized layouts and visualizations should be implemented to maintain consistency across the organization. Dashboard versions should be tracked to manage updates and changes effectively and user feedback should be collected to improve and refine them. 
+
+In addition, dashboards performance should be optimized to ensure they load quickly and efficiently.
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::group_by(DashboardName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  ggplot( aes(x = reorder(DashboardName, n),
+              y = n)) +
+  geom_bar( stat = "identity", fill = "#0033A0") +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "What are the Most Frequently Accessed Dashboards?", 
+       x = "Dashboard Name", y = "", 
+       subtitle = "This chart outline the importance of naming conventions",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topDashboard <- logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::group_by(DashboardName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  dplyr::arrange(n)
+# c("Embedding for your customers", "Embedding for your organization",
+#   "Export Report", "Power BI Mobile", "Power BI Office Personal App",
+#   "Power BI Teams Notification", "Power BI Teams Personal App",
+#   "Power BI Teams Tab App", "Power BI Web", "PowerPoint add-in",
+#   "Simplified Embedding")
+
+logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::filter(DashboardName %in% topDashboard$DashboardName ) |>
+  dplyr::mutate( DashboardName  = factor( DashboardName , levels = topDashboard$DashboardName )) |>
+  dplyr::group_by(DashboardName, Consumption) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::group_by(Consumption) |>
+  dplyr::mutate( per = round(100* n /sum(n ),1)) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x =  DashboardName ,
+              y = n,
+              fill = Consumption)) +
+  geom_bar( stat = "identity" ) +
+  #geom_bar( stat = "identity", fill = "#0033A0") +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #facet_wrap( vars( grade_cat), nrow =2) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "How those Dashboards are being accessed?", 
+       x = "Dashboard Name", y = "", 
+       subtitle = "Should more focus being given to have products easily accessible on mobile?",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topDashboard <- logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::group_by(DashboardName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  dplyr::arrange(n)
+
+logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::filter(DashboardName %in% topDashboard$DashboardName ) |>
+  dplyr::mutate( DashboardName  = factor( DashboardName , levels = topDashboard$DashboardName )) |>
+  dplyr::group_by(DashboardName, grade_cat) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::group_by(grade_cat) |>
+  dplyr::mutate( per = round(100* n /sum(n ),1),
+                  grade_cat = factor(grade_cat, levels = c("Director",
+                                                                    "P4 to P5",
+                                                                    "P1 to P3 / NO",
+                                                                    "G6 to G8",
+                                                                    "G1 to G5",
+                                                                    "No Grade"))) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x =  DashboardName ,
+              y = n,
+              fill = grade_cat)) +
+  geom_bar( stat = "identity" ) +
+  #geom_bar( stat = "identity", fill = "#0033A0") +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #facet_wrap( vars( grade_cat), nrow =2) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Who are viewing those top Dashboards?",
+       x = "Dashboard Name", y = "",       
+       subtitle = "The more diverse is the audience, the more likely the report is critical. \n NA indicated users that could not be matched with PRISM Staff Listing extracts",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topDashboard <- logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::filter(grade_cat %in% c("Director",  "P4 to P5") ) |>
+  dplyr::group_by(DashboardName) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::arrange(desc(n)) |>
+  head(15) |>
+  dplyr::arrange(n)
+
+logs |> 
+  dplyr::filter(Operation =="ViewDashboard" ) |>
+  dplyr::filter(grade_cat %in% c("Director",  "P4 to P5") ) |>
+  dplyr::filter(DashboardName %in% topDashboard$DashboardName ) |>
+  dplyr::mutate( DashboardName  = factor( DashboardName , levels = topDashboard$DashboardName )) |>
+  dplyr::group_by(DashboardName, grade_cat) |>
+  dplyr::summarise( n = dplyr::n()) |>
+  dplyr::group_by(grade_cat) |>
+  dplyr::mutate( per = round(100* n /sum(n ),1),
+                  grade_cat = factor(grade_cat, levels = c("Director",
+                                                                    "P4 to P5",
+                                                                    "P1 to P3 / NO",
+                                                                    "G6 to G8",
+                                                                    "G1 to G5",
+                                                                    "No Grade"))) |>
+  dplyr::arrange(desc(n)) |>
+  ggplot( aes(x =  DashboardName ,
+              y = n,
+              fill = grade_cat)) +
+  geom_bar( stat = "identity" ) +
+  #geom_bar( stat = "identity", fill = "#0033A0") +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #facet_wrap( vars( grade_cat), nrow =2) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "What are the top Dashboards for P4 & Above users??",
+       x = "Dashboard Name", y = "",       
+       subtitle = "The more diverse is the audience, the more likely the report is critical. \n NA indicated users that could not be matched with PRISM Staff Listing extracts",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+```{r ph=officer::ph_location_fullsize()}
+# logs |> 
+#   dplyr::filter(Operation =="ViewDashboard" ) |>
+#   dplyr::filter(iom_user  == "No" & iom_admin =="No" ) |>
+#   dplyr::group_by(DashboardName) |>
+#   dplyr::summarise( n = dplyr::n()) |>
+#   dplyr::arrange(desc(n)) ->d |>
+#   head(15) |>
+#   ggplot( aes(x = reorder(DashboardName, n),
+#               y = n)) +
+#   geom_bar( stat = "identity", fill = "#0033A0") +
+#   #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+#   labs(title = "What Dashboards are consumed by non IOM users?", 
+#        x = "Dashboard Name", y = "", 
+#        subtitle = "Few Dashboards are actually consumed externally",
+#        caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+#   coord_flip()+
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+#                                                     scale_cut = cut_short_scale()),
+#                       expand = expansion(c(0, 0.01))   ) +  
+#  iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+# Applications
+
+An `app` in Power BI is a packaged collection of related dashboards and reports that you can share with others. It's designed to provide a streamlined and organized way to distribute content to a wider audience, aka provide a user-friendly navigation structure to make it easy for users to find the information they need..
+
+`Apps` in Power BI help you distribute and manage access to your dashboards and reports efficiently, ensuring that your audience gets the insights they need without compromising data security or workspace organization
+ 
+Users can install `apps` from the Power BI service, and once installed, they can view and interact with the dashboards and reports within the app. This is particularly useful for distributing content to large groups or across an organization.
+
+Ideally, app content should be updated regularly, and users should be notified of any significant changes or new additions
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+
+logs |> 
+  dplyr::filter(Operation %in% c("ViewDashboard","ViewReport" )) |>
+  dplyr::filter(! (is.na(AppName))) |>
+  dplyr::group_by(AppName, Operation) |>
+  summarise(ActivityCount = n())  |>
+  head(15)  |>
+  dplyr::ungroup() |>
+  arrange(desc(ActivityCount))  |> 
+  ggplot( aes(x = reorder(stringr::str_wrap(AppName, 40), ActivityCount) ,
+              y = ActivityCount )) +
+  geom_bar(stat = "identity" , fill = "#0033A0") +
+  labs(title = "What are the most Frequently Accessed App?", x = "", y = "", 
+       subtitle = "Dashboards and reports packaged within an App can gain better accessibility",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 14,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+---
+
+# Part 2 --Users Metrics 
+
+
+| **Indicator Name**           | **Why It's Useful**                                                                 | **How to Calculate**                                                                                                           |
+|------------------------------|-------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| **Workspace Content** | Tracks how many Reports, Dashboard, Dataset & Users per Workspace |
+| **Workspace Members** | Tracks changes in workspace membership to ensure proper access control.          | Analyze `AddMember` and `RemoveMember` events to monitor changes in workspace membership and ensure appropriate access levels. |
+| **User Activity**            | Tracks user engagement and identifies active vs. inactive users.                    | Count the number of activities per user by filtering `Get-PowerBIActivityEvent` results for user-specific actions.             |
+| **Access and Security Logs** | Monitors access patterns and detects unauthorized access attempts.                  | Analyze `UserLogin` and `AccessDenied` events to identify unusual access patterns and potential security breaches.             |
+
+
+--- 
+
+# WorkSpace
+
+A `workspace` is like a folder where data analyst can store and manage all Power BI content and where teams can collaborate to share content, and control access.
+
+Each `workspace` can contain multiple dashboards, reports, apps and datasets.
+
+Ideally, to manage access and content more effectively, Workspaces should be created based on specific purposes or departments (e.g., Missions, Projects, etc.) to make them easily identifiable. Creating a clear and consistent naming convention for PowerBI workspaces can help keep everything organized and easily identifiable.
+
+[Global/Region]_[Topic(no Acronym)]_[Mission-if-applicable]_[Unit]_
+
+For example:
+ * Global_Human-Resource
+ * Western_Africa_Resettlement
+ * Eastern_Africa_Resettlement_Uganda
+ 
+
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+WorkSpace |>  
+  group_by(Type, SkuDesc) |>
+  summarise(n = n()) |>
+  arrange(desc(n))  |>
+  ggplot( aes(x = reorder(Type, n), 
+              fill = SkuDesc ,
+              y = n )) +
+  geom_bar(stat = "identity"  ) +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  
+   facet_wrap( vars( SkuDesc ), nrow =2, scales = "free") + 
+  #geom_bar(stat = "identity" , fill = "#0033A0") + 
+  labs(title = "What type of Workspaces we have in the tenant?",
+       subtitle = "Microsoft offers different subscription options to enable computing resources (aka Capacity) for running Power BI & Fabric services.",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Admin Directory") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X", legend= FALSE) -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+workspace_profile |>  
+  arrange(desc(Reports_count))  |>
+  head(10) |>
+  ggplot( aes(x = reorder(WorkSpaceName, Reports_count), 
+              fill = SkuDesc ,
+              y = Reports_count)) +
+  #geom_bar(stat = "identity"  ) +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  
+  # facet_wrap( vars( SkuDesc ), nrow =2, scales = "free") + 
+  geom_bar(stat = "identity" ) + 
+  labs(title = "What are the  Workspaces that incude the largest number of reports ?",
+       subtitle = "Microsoft offers different subscription options to enable computing resources (aka Capacity) for running Power BI & Fabric services.",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Admin Directory") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+
+ iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+workspace_profile |>  
+  arrange(desc(Dashboards_Count))  |>
+  head(10) |>
+  ggplot( aes(x = reorder(WorkSpaceName, Dashboards_Count), 
+              fill = SkuDesc ,
+              y = Dashboards_Count)) +
+  #geom_bar(stat = "identity"  ) +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  
+  # facet_wrap( vars( SkuDesc ), nrow =2, scales = "free") + 
+  geom_bar(stat = "identity" ) + 
+  labs(title = "What are the  Workspaces that incude the largest number of Dashboards ?",
+       subtitle = "Microsoft offers different subscription options to enable computing resources (aka Capacity) for running Power BI & Fabric services.",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Admin Directory") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+
+ iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+workspace_profile |>  
+  arrange(desc(Reports_count))  |>
+  head(10) |>
+  ggplot( aes(x = reorder(WorkSpaceName, Reports_count), 
+              fill = SkuDesc ,
+              y = Reports_count)) +
+  #geom_bar(stat = "identity"  ) +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  
+  # facet_wrap( vars( SkuDesc ), nrow =2, scales = "free") + 
+  geom_bar(stat = "identity" , fill = "#0033A0") + 
+  labs(title = "What are the  Workspaces that incude the largest number of reports ?",
+       subtitle = "Microsoft offers different subscription options to enable computing resources (aka Capacity) for running Power BI & Fabric services.",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Admin Directory") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+
+ iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X", legend= FALSE) -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+topWorkSpaceName <- logs |> 
+  filter( !(is.na(WorkSpaceName))) |>
+  filter( Operation %in% c( "ViewReport",   "ViewDashboard" ) ) |>
+  group_by(WorkSpaceName ) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  head(15)  |>
+  arrange(ActivityCount)
+
+logs |> 
+  filter( !(is.na(WorkSpaceName))) |>
+  # filter( Operation %in% c( "ViewReport", "CreateReport", "EditReport", "DeleteReport", "ViewDashboard", "CreateDashboard", "EditDashboard", "DeleteDashboard", "ShareDashboard", "ShareReport") ) |>
+  filter( Operation %in% c( "ViewReport",   "ViewDashboard" ) ) |>
+  group_by(WorkSpaceName, Operation) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))  |>
+  filter( WorkSpaceName %in% topWorkSpaceName$WorkSpaceName)  |>
+  mutate(  WorkSpaceName = factor( WorkSpaceName, levels = topWorkSpaceName$WorkSpaceName )) |>
+  ggplot( aes(x = WorkSpaceName ,
+              y = ActivityCount , 
+              fill = Operation)) +
+  geom_bar(stat = "identity" ) +
+  iomthemes::scale_fill_iom_d(direction = -1) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "What are the top Viewed Workspace?",
+       subtitle = "As we can see, there is no clear naming conventions for workspace. And a lot of traffic goes to some personal workspace....",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 12,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+```{r}
+# Workpsace usage by Region
+```
+
+
+```{r}
+# number of workspaces delivering content from apps
+```
+
+```{r}
+WorkSpaceProfile <- Users |> 
+  group_by(WorkSpaceName, CapacityId,
+           AccessRight) |>
+  summarise(Count = n(), .groups = 'drop') |>
+  pivot_wider(names_from = AccessRight, values_from = Count, values_fill = list(Count = 0)) |>
+  dplyr::arrange(desc(Admin))
+```
+
+```{r}
+# WorkSpaceAdmin <- Users |> 
+#   filter(  AccessRight =="Admin")
+```
+
+---
+
+```{r}
+# toDatasetConfigurator <- Datasets |>   
+#   filter( CapacityName == "IOM - Reporting Platform") |>
+#   filter(  ! (is.na(ConfiguredBy))) |>
+#   dplyr::group_by(ConfiguredBy, given_name, surname, job_title, department, 
+#            country_usage, 
+#            grade_cat, position_name,name_of_organizational_unit, country_name, 
+#            l3_org, l4_org, l5_org, l6_org ) |>
+#   dplyr::summarise( n = dplyr::n()) |>
+#   dplyr::arrange(desc(n))  |>
+#   filter(n >3)
+  
+```
+
+
+---
+
+# Identifying the "PowerBI Users Champions Network"
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+data.map <- logs |>
+  dplyr::filter(! (is.na(usage_location ))) |>
+  dplyr::filter(  UserId %in% userpbi_p1$ConfiguredBy  ) |> 
+  dplyr::group_by(usage_location, country_usage ) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  dplyr::ungroup() |>
+  # Merge the sample data with the centroids data
+  left_join(centroid, by = c("usage_location"= "ISO"))
+
+
+# Create natural breaks for the value classes
+breaks <- classInt::classIntervals(data.map$ActivityCount, n = 5, style = "jenks")$brks
+labels <- paste0("(", round(breaks[-length(breaks)], 1), " - ", round(breaks[-1], 1), "]")
+
+label_top_10 <- data.map  |>
+                 dplyr::arrange(desc(ActivityCount)) |> 
+                dplyr::slice_head(n = 10) |>
+                dplyr::mutate( label = paste0(
+                 usage_location, ": ",
+                 ActivityCount,
+              #  scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(ActivityCount),
+                " "))
+#scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(label_top_10$ActivityCount) 
+ 
+# Plot the world map with proportional symbols at centroids
+ggplot(data = world) +
+  geom_sf(fill = "lightgray", alpha = 0.8, color = "white") +
+  geom_point(data = data.map,
+             aes(x = long,
+                 y = lat,
+                 size = ActivityCount),
+             color = "#0033A0", alpha = 0.5) +
+  ggrepel::geom_label_repel(data = label_top_10,  
+                            aes(x = long,
+                                y = lat, 
+                                label = label)    ) +
+  scale_size_continuous(range = c(1, 10),breaks = 1:5, labels = labels) + # 
+  labs(
+    title = "Number of Events for Users Registered within the PowerBI Premium Capacity ",
+    subtitle = paste0("Based on Active Directory User location -  Number of Events: ",
+                      scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()) (sum(data.map$ActivityCount)),
+                      " Events"),
+    x="",
+    y = "",
+    caption = "IOM PowerBI Logs - 19 Nov to 15 Dec 2024",
+       size = "Value") +
+  coord_sf() +  
+  theme_iom(void = TRUE, legend = FALSE)-> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+#Top Users by Activity
+logs |> 
+  dplyr::filter(  UserId %in% userpbi_p1$ConfiguredBy)   |>
+  dplyr::mutate(User = paste0(UserId, "-", country_usage, "- ", position_name, "- ", grade_cat)) |>
+  group_by(User) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  head(20) |>
+
+ ggplot( aes(x = reorder(User, ActivityCount), 
+                      y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  labs(title = "WHo are the most active users among those registered within PowerBI Premium?",
+       subtitle = "The top 20 users by activity count.",
+       x = "User ID", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+  coord_flip()+
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+data.map <- logs |>
+  dplyr::filter(! (is.na(usage_location ))) |>
+  dplyr::filter( ! (UserId %in% userpbi_p1$ConfiguredBy) ) |>
+  dplyr::filter(Operation %in% c("ViewDashboard","ViewReport" )) |>
+  dplyr::group_by(usage_location, country_usage ) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  dplyr::ungroup() |>
+  # Merge the sample data with the centroids data
+  left_join(centroid, by = c("usage_location"= "ISO"))
+
+
+# Create natural breaks for the value classes
+breaks <- classInt::classIntervals(data.map$ActivityCount, n = 5, style = "jenks")$brks
+labels <- paste0("(", round(breaks[-length(breaks)], 1), " - ", round(breaks[-1], 1), "]")
+
+label_top_10 <- data.map  |>
+                 dplyr::arrange(desc(ActivityCount)) |> 
+                dplyr::slice_head(n = 10) |>
+                dplyr::mutate( label = paste0(
+                 usage_location, ": ",
+                 ActivityCount,
+              #  scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(ActivityCount),
+                " "))
+#scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(label_top_10$ActivityCount) 
+ 
+# Plot the world map with proportional symbols at centroids
+ggplot(data = world) +
+  geom_sf(fill = "lightgray", alpha = 0.8, color = "white") +
+  geom_point(data = data.map,
+             aes(x = long,
+                 y = lat,
+                 size = ActivityCount),
+             color = "#0033A0", alpha = 0.5) +
+  ggrepel::geom_label_repel(data = label_top_10,  
+                            aes(x = long,
+                                y = lat, 
+                                label = label)    ) +
+  scale_size_continuous(range = c(1, 10),breaks = 1:5, labels = labels) + # 
+  labs(
+    title = "Reports or Dashboards View Events Per Usage location ",
+    subtitle = paste0("Based on Active Directory User location - Excluding users registered on PBI premium - Number of Events: ",
+                      scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()) (sum(data.map$ActivityCount)),
+                      " Events"),
+    x="",
+    y = "",
+    caption = "IOM PowerBI Logs - 19 Nov to 15 Dec 2024",
+       size = "Value") +
+  coord_sf() +  
+  theme_iom(void = TRUE, legend = FALSE)-> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+#Top Users by Activity
+logs |>
+  dplyr::filter(Operation %in% c("ViewDashboard","ViewReport" )) |>
+  dplyr::filter( ! (UserId %in% userpbi_p1$ConfiguredBy) ) |>
+  dplyr::mutate(User = paste0(UserId, "-", country_usage, "- ", position_name, "- ", grade_cat)) |>
+  group_by(User) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  head(20) |>
+
+ ggplot( aes(x = reorder(User, ActivityCount), 
+                      y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  labs(title = "WHo are the most active Dashboard & Report viewer?",
+       subtitle = "The top 20 users by activity count.",
+       x = "User ID", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+  coord_flip()+
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+data.map <- logs |>
+  dplyr::filter(! (is.na(usage_location ))) |>
+
+  dplyr::filter(grade_cat %in% c("Director",  "P4 to P5") ) |>
+  dplyr::group_by(usage_location, country_usage ) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  dplyr::ungroup() |>
+  # Merge the sample data with the centroids data
+  left_join(centroid, by = c("usage_location"= "ISO"))
+
+
+# Create natural breaks for the value classes
+breaks <- classInt::classIntervals(data.map$ActivityCount, n = 5, style = "jenks")$brks
+labels <- paste0("(", round(breaks[-length(breaks)], 1), " - ", round(breaks[-1], 1), "]")
+
+label_top_10 <- data.map  |>
+                 dplyr::arrange(desc(ActivityCount)) |> 
+                dplyr::slice_head(n = 10) |>
+                dplyr::mutate( label = paste0(
+                 usage_location, ": ",
+                 ActivityCount,
+              #  scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(ActivityCount),
+                " "))
+#scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(label_top_10$ActivityCount) 
+ 
+# Plot the world map with proportional symbols at centroids
+ggplot(data = world) +
+  geom_sf(fill = "lightgray", alpha = 0.8, color = "white") +
+  geom_point(data = data.map,
+             aes(x = long,
+                 y = lat,
+                 size = ActivityCount),
+             color = "#0033A0", alpha = 0.5) +
+  ggrepel::geom_label_repel(data = label_top_10,  
+                            aes(x = long,
+                                y = lat, 
+                                label = label)    ) +
+  scale_size_continuous(range = c(1, 10),breaks = 1:5, labels = labels) + # 
+  labs(
+    title = "P4 & Above Users Activity",
+    subtitle = paste0("Based on Active Directory User location - for P4 & Above - Number of Events: ",
+                      scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()) (sum(data.map$ActivityCount)),
+                      " Events"),
+    x="",
+    y = "",
+    caption = "IOM PowerBI Logs - 19 Nov to 15 Dec 2024",
+       size = "Value") +
+  coord_sf() +  
+  theme_iom(void = TRUE, legend = FALSE)-> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+#Top Users by Activity
+logs |>
+
+  dplyr::filter(grade_cat %in% c("Director",  "P4 to P5") ) |>
+  dplyr::mutate(User = paste0(UserId, "-", country_usage, "- ", position_name, "- ", grade_cat)) |>
+  group_by(User) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  head(20) |>
+
+ ggplot( aes(x = reorder(User, ActivityCount), 
+                      y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  labs(title = "WHo are the most active P4 & Above users?",
+       subtitle = "The top 20 users by activity count.",
+       x = "User ID", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+  coord_flip()+
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+---
+
+```{r ph=officer::ph_location_fullsize()}
+
+data.map <- logs |>
+  dplyr::filter(! (is.na(usage_location ))) |>
+
+  dplyr::filter(grade_cat %in% c("Director") ) |>
+  dplyr::group_by(usage_location, country_usage ) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  dplyr::ungroup() |>
+  # Merge the sample data with the centroids data
+  left_join(centroid, by = c("usage_location"= "ISO"))
+
+
+# Create natural breaks for the value classes
+breaks <- classInt::classIntervals(data.map$ActivityCount, n = 5, style = "jenks")$brks
+labels <- paste0("(", round(breaks[-length(breaks)], 1), " - ", round(breaks[-1], 1), "]")
+
+label_top_10 <- data.map  |>
+                 dplyr::arrange(desc(ActivityCount)) |> 
+                dplyr::slice_head(n = 10) |>
+                dplyr::mutate( label = paste0(
+                 usage_location, ": ",
+                 ActivityCount,
+              #  scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(ActivityCount),
+                " "))
+#scales::label_number(accuracy = 1, scale_cut = cut_short_scale())(label_top_10$ActivityCount) 
+ 
+# Plot the world map with proportional symbols at centroids
+ggplot(data = world) +
+  geom_sf(fill = "lightgray", alpha = 0.8, color = "white") +
+  geom_point(data = data.map,
+             aes(x = long,
+                 y = lat,
+                 size = ActivityCount),
+             color = "#0033A0", alpha = 0.5) +
+  ggrepel::geom_label_repel(data = label_top_10,  
+                            aes(x = long,
+                                y = lat, 
+                                label = label)    ) +
+  scale_size_continuous(range = c(1, 10),breaks = 1:5, labels = labels) + # 
+  labs(
+    title = "Directors Users Activity",
+    subtitle = paste0("Based on Active Directory User location - Number of Events: ",
+                      scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()) (sum(data.map$ActivityCount)),
+                      " Events"),
+    x="",
+    y = "",
+    caption = "IOM PowerBI Logs - 19 Nov to 15 Dec 2024",
+       size = "Value") +
+  coord_sf() +  
+  theme_iom(void = TRUE, legend = FALSE)-> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+#Top Users by Activity
+logs |>
+
+  dplyr::filter(grade_cat %in% c("Director" ) ) |>
+  dplyr::mutate(User = paste0(UserId, "-", country_usage, "- ", position_name, "- ", grade_cat)) |>
+  group_by(User) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  head(20) |>
+
+ ggplot( aes(x = reorder(User, ActivityCount), 
+                      y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  labs(title = "WHo are the most active Directors users?",
+       subtitle = "The top 20 users by activity count.",
+       x = "User ID", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+  coord_flip()+
+ iomthemes::theme_iom(font_size = 11,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+logs |>
+  dplyr::mutate(User = paste0(UserId, "-", country_usage, "- ", position_name, "- ", grade_cat)) |>
+   dplyr::filter(Workload =="Copilot")  |>
+  group_by(User) |> 
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  head(15)  |>
+ ggplot( aes(x = reorder(User , ActivityCount), y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  labs(title = "Who is using Copilot within PowerBI?",
+       x = "",
+       y = "",
+       subtitle = " .",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+---
+
+# Part 3 --Events Metrics 
+
+
+| **Indicator Name**           | **Why It's Useful**                                                                 | **How to Calculate**                                                                                                           |
+|------------------------------|-------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| **Query Performance**        | Monitors the performance of queries to identify and optimize slow-running queries.   | Measure the duration of `QueryExecution` events from the logs and calculate average execution time per query.                  |
+| **Data Refresh Success Rate**| Ensures data reliability by tracking the success rate of scheduled data refreshes.   | Calculate the percentage of successful `DataRefresh` events out of the total scheduled refresh attempts.                       |
+| **Resource Utilization**     | Optimizes resource allocation by understanding usage patterns.                      | Track the usage of resources like memory and CPU during report execution using `ResourceUsage` events.                         |
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  
+  group_by( CreationDay) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |>   
+  # Activity_type
+  ggplot( aes(x = CreationDay, y = ActivityCount)) +
+ # geom_bar(stat = "identity" ) +
+   geom_bar(stat = "identity" , fill = "#0033A0") +
+  labs(title = "User Activity Over Time",
+       subtitle = "Explanation: This histogram shows user activity over time, aggregated by hour. It helps identify peak usage times.",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 15,  grid = "Y", axis = "Y", axis_title = "X")  +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 10)) -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+```{r ph=officer::ph_location_fullsize()}
+# logs |> 
+#   filter( ! (Activity == "CreateFile")) |>
+#   filter( ! (Activity_type == "No Category")) |>
+#   group_by(Activity_type, CreationDay) |>
+#   summarise(ActivityCount = n()) |>
+#   arrange(desc(ActivityCount))   |>   
+#   # Activity_type
+#   ggplot( aes(x = CreationDay, y = ActivityCount, fill = Activity_type)) +
+#   geom_bar(stat = "identity" ) +
+#   facet_wrap( vars( Activity_type), nrow =3) + 
+#   #geom_bar( fill = "#0033A0") +
+#   scale_fill_viridis_d() +
+#   labs(title = "User Activity Over Time",
+#        subtitle = "Explanation: This histogram shows user activity over time, aggregated by day. It helps identify peak usage times.",
+#        x = "", y = "",
+#        caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+#                                                     scale_cut = cut_short_scale()),
+#                       expand = expansion(c(0, 0.01))   ) +  
+#  iomthemes::theme_iom(font_size = 12,  grid = "Y", axis = "Y", axis_title = "X", legend = FALSE)  +
+#   theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 8)) -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+# Reduce the ratio of exports to views by a certain percentage. This key result measures how often users export data to files instead of using existing reports for their analysis—a ratio close to one indicates that users are regularly exporting data, which is a governance risk.
+
+excel <- logs |> 
+  
+  filter(  Activity == "AnalyzeInExcel" ) |>
+  select(DatasetName, DatasourceInformations)
+
+logs |> 
+  
+  filter(  Activity == "AnalyzeInExcel" ) |>
+  group_by( CreationDay) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |>   
+  # Activity_type
+  ggplot( aes(x = CreationDay, y = ActivityCount)) +
+ # geom_bar(stat = "identity" ) +
+   geom_bar(stat = "identity" , fill = "#0033A0") +
+  labs(title = "Export to Excel",
+       subtitle = "Measures how often users export data to files instead of using existing reports for their analysis, which is a governance risk..",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 15,  grid = "Y", axis = "Y", axis_title = "X")  +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 10)) -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+---
+
+```{r ph=officer::ph_location_fullsize()}
+ 
+#(logs$IsSuccess, useNA= "ifany")
+# number of refresh failures
+logs |> 
+ # filter( IsSuccess != "TRUE")
+  filter(  Activity %in% c(# "CancelDataflowRefresh", "CancelDatasetRefresh",
+                      "RefreshDataset", "RefreshSqlAnalyticsEndpointLakehouseMetadata",
+                        "RequestDataflowRefresh"#,
+                     # "SetScheduledRefresh","SetScheduledRefreshOnDataflow"
+                      ) ) -> refresh
+
+refresh |>   
+  group_by( CreationDay) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount)) |>
+  # Activity_type
+  ggplot( aes(x = CreationDay, y = ActivityCount)) +
+ # geom_bar(stat = "identity" ) +
+   geom_bar(stat = "identity" , fill = "#0033A0") +
+  labs(title = "Data Refreshing Events by Day",
+       subtitle = "",
+       x = "", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+ iomthemes::theme_iom(font_size = 15,  grid = "Y", axis = "Y", axis_title = "X")  +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 10)) -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+ 
+
+
+```{r}
+#  ratio of Power BI semantic models to reports 
+# his key result measures whether semantic models are reused for ad hoc analysis and reporting, or whether data is duplicated across models—a ratio close to one indicates that users might be creating a new semantic model for each report, which is a governance risk.
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  group_by(ActivityPart1) |>
+  summarise(ActivityPart1Count = n()) |>
+  arrange(desc(ActivityPart1Count))   |>
+  # dplyr::mutate(ActivityPart12 = fct_lump_prop(ActivityPart1 , prop = 0.002, w = ActivityPart1Count, other_level = "Other Activities (<5% total)" ))   |>
+  # group_by(ActivityPart12) |>
+  # summarise(ActivityPart1Count = n()) |>
+  arrange(desc(ActivityPart1Count))   |>
+  head(20) |>
+  
+  ggplot(
+       aes(x = reorder(ActivityPart1, ActivityPart1Count), 
+           y = ActivityPart1Count)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Most common activities performed by users", 
+       subtitle = "Distribution of different activities events recorded in the log by Main Category.",
+       x = "ActivityType", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  filter (ActivityPart1 == "Create") |>
+  group_by(Activity) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |> 
+  head(10)  |>
+  
+  ggplot(
+       aes(x = reorder(Activity, ActivityCount), 
+           y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Most common Create activities", 
+       subtitle = "Distribution of different activities events recorded in the log by Main Category.",
+       x = "ActivityType", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  filter (ActivityPart1 == "Get") |>
+  group_by(Activity) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |> 
+  head(10)  |>
+  
+  ggplot(
+       aes(x = reorder(Activity, ActivityCount), 
+           y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Most common Get activities", 
+       subtitle = "Distribution of different activities events recorded in the log by Main Category.",
+       x = "ActivityType", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  filter (ActivityPart1 == "View") |>
+  group_by(Activity) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |> 
+  head(20)  |>
+  
+  ggplot(
+       aes(x = reorder(Activity, ActivityCount), 
+           y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Most common Viewing activities", 
+       subtitle = "Distribution of different activities events recorded in the log by Main Category.",
+       x = "ActivityType", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  filter (ActivityPart1 == "Generate") |>
+  group_by(Activity) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |> 
+  arrange(desc(ActivityCount))   |>
+  head(20)  |>
+  
+  ggplot(
+       aes(x = reorder(Activity, ActivityCount), 
+           y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Most common Generate activities", 
+       subtitle = "Distribution of different activities events recorded in the log by Main Category.",
+       x = "ActivityType", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+logs |> 
+  filter (ActivityPart1 == "Read") |>
+  group_by(Activity) |>
+  summarise(ActivityCount = n()) |>
+  arrange(desc(ActivityCount))   |> 
+  arrange(desc(ActivityCount))   |>
+  head(20)  |>
+  
+  ggplot(
+       aes(x = reorder(Activity, ActivityCount), 
+           y = ActivityCount)) +
+  geom_bar(stat = "identity", fill = "#0033A0") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Most common Read Activities", 
+       subtitle = "Distribution of different activities events recorded in the log by Main Category.",
+       x = "ActivityType", y = "",
+       caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+  coord_flip()+
+  scale_y_continuous( labels = scales::label_number(accuracy = 1,   
+                                                    scale_cut = cut_short_scale()),
+                      expand = expansion(c(0, 0.01))   ) +  
+  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+
+dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+ 
+
+---
+
+# Conclusion: Actions to come
+
+ 1. Minor changes in the [tenant settings](https://valleybi.com/articles/power-bi-admin-best-practices/)  -> Naming Convention
+ 
+ 2. Solution audits and optimizations that improve performance and reduce capacity usage and costs. _> Enforce [Reports Usage Metrics app](https://learn.microsoft.com/en-us/power-bi/collaborate-share/service-modern-usage-metrics) and [Incremental Data Refresh]()
+ 
+ 3. Consolidate community of practice, themes, templates, and design guidelines for reports
+ 
+ 4. Beginning to connect Power BI or Fabric champions to start a champions network for these individuals to share knowledge and practices.
+
+ 5. [Training for key users](https://learn.microsoft.com/en-us/power-bi/)
+ 
+ 6. Using version control systems (Azure Dev Ops) for both Data Engineering & Data Analysis
+ 
+ 7. Implement Row-Level Security (RLS) Hierarchies
+ 
+ 8. Set up Dashboard and data pipeline [certification](https://learn.microsoft.com/en-us/fabric/admin/endorsement-certification-enable) and endorsement process
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+# logs |> ggplot( aes(x = IsSuccess)) +
+#   geom_bar(fill = "#0033A0") +
+#   labs(title = "Success vs Failure of Operations",
+#        subtitle = "Explanation: This chart shows the number of successful and failed operations. It helps assess the reliability of operations.",
+#        
+#        x = "Is Success", y = "",
+#        caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+#   coord_flip()+
+#  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+``` 
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+
+# logs |>
+#    dplyr::filter(! (is.na(DataConnectivityMode)) ) |>
+#   group_by(DataConnectivityMode) |>
+#   summarise(ActivityCount = n()) |>
+#   arrange(desc(ActivityCount)) |> 
+#  ggplot( aes(x = reorder(DataConnectivityMode, ActivityCount), y = ActivityCount)) +
+#   geom_bar(stat = "identity", fill = "#0033A0") +
+#   labs(title = "Data Connectivity Modes",
+#        x = "Data Connectivity Mode", 
+#        y = "", 
+#        subtitle = " .",
+#        caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024") +
+#   coord_flip()+
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+#  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X") -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+``` 
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+# Assuming 'Department' is a column in the logs
+# logs |> ggplot( aes(x = Department, fill = Activity)) +
+#   geom_bar(position = "dodge") +
+#   theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+#   labs(title = "User Activity by Department or Team", x = "Department", y = "", 
+#        subtitle = "Explanation: This chart shows user activity by department or team.",
+#        caption= "Data Source: IOM PowerBI Tenant Event Logs - 19 Nov to 15 Dec 2024")
+#   coord_flip()+
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+#  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X")   -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+# Assuming 'UserRole' is a column in the logs
+# logs |> ggplot( aes(x = UserRole, fill = Activity)) +
+#   geom_bar(position = "dodge") +
+#   theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+#   labs(title = "Distribution of User Roles and Activities", x = "User Role", y = "", 
+#        subtitle = "Explanation: This chart shows the distribution of user roles and their corresponding activities.")
+#   coord_flip()+
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+#  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X")   -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
+--- 
+
+```{r ph=officer::ph_location_fullsize()}
+# Assuming 'SharingAction' is a column in the logs
+# logs |> ggplot( aes(x = SharingAction)) +
+#   geom_bar(fill = "#0033A0") +
+#   theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+#   labs(title = "Effectiveness of Sharing and Collaboration Features", x = "Sharing Action", y = "", 
+#        subtitle = "Explanation: This bar chart shows the top 10 users by activity count.") +
+#   coord_flip()+
+#   scale_y_continuous( labels = scales::label_number(accuracy = 1,   scale_cut = cut_short_scale()))+
+#  iomthemes::theme_iom(font_size = 15,  grid = "X", axis = "Y", axis_title = "X")   -> mygg
+# 
+# dml(ggobj = mygg, fonts = list(serif = 'Open Sans'))
+```
+
